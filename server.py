@@ -502,7 +502,7 @@ def delete_entry(acting_as: str, entry_id: int, tricount: str | None = None, con
 def main() -> None:
     port = os.environ.get("PORT")
     if port:  # Cloud Run (o cualquier despliegue HTTP): streamable HTTP sin estado
-        server.run("streamable-http", host="0.0.0.0", port=int(port), stateless_http=True, json_response=True)
+        server.run("streamable-http", host=os.environ.get("TRICOUNT_BIND_HOST", "0.0.0.0"), port=int(port), stateless_http=True, json_response=True)
     else:  # uso local: stdio
         server.run()
 
