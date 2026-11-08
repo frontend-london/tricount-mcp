@@ -45,7 +45,8 @@ def parse_key(tricount: str) -> str:
 @dataclass
 class Allocation:
     member: str
-    amount: Decimal  # positivo = parte que le corresponde a ese miembro
+    amount: Decimal  # original currency, positive member share
+    amount_registry: Decimal | None = None  # registry currency, avoids repeated FX rounding
 
 
 @dataclass
@@ -80,7 +81,8 @@ class Tricount:
             bal[e.paid_by] = bal.get(e.paid_by, Decimal(0)) + e.amount_registry
             ratio = e.amount_registry / e.amount if e.amount else Decimal(1)
             for a in e.allocations:
-                bal[a.member] = bal.get(a.member, Decimal(0)) - a.amount * ratio
+                registry_share = a.amount_registry if a.amount_registry is not None else a.amount * ratio
+                bal[a.member] = bal.get(a.member, Decimal(0)) - registry_share
         return {m: v.quantize(Decimal("0.01")) for m, v in bal.items()}
 
     def settlement(self) -> list[dict]:
@@ -122,28 +124,46 @@ def _parse(key: str, raw: dict) -> Tricount:
         e = item["RegistryEntry"]
         if e.get("status") == "DELETED":
             continue
-        amount, cur = _money(e["amount"])
-        # Elegimos el monto que esté en la moneda del tricount para los balances.
-        amount_reg = amount
-        for k in ("amount", "amount_local"):
-            if e.get(k) and e[k]["currency"] == currency:
-                amount_reg = Decimal(e[k]["value"])
-                break
+        # Tricount API stores group-currency amounts in `amount` and the original
+        # payment currency in `amount_local`. Older entries may omit amount_local.
+        local_obj = e.get("amount_local") or e["amount"]
+        local_amount, cur = _money(local_obj)
+        registry_obj = next(
+            (e[k] for k in ("amount", "amount_local")
+             if e.get(k) and e[k]["currency"] == currency), None
+        )
+        if registry_obj is None:
+            raise ValueError(f"Entry {e['id']}: missing group-currency amount ({currency})")
+        registry_amount = Decimal(registry_obj["value"])
+        allocations = []
+        for a in e.get("allocations", []):
+            local_part_obj = next(
+                (a[k] for k in ("amount_local", "amount")
+                 if a.get(k) and a[k]["currency"] == cur), None
+            )
+            registry_part_obj = next(
+                (a[k] for k in ("amount", "amount_local")
+                 if a.get(k) and a[k]["currency"] == currency), None
+            )
+            if local_part_obj is None or registry_part_obj is None:
+                raise ValueError(f"Entry {e['id']}: allocation currency incomplete")
+            local_part = -Decimal(local_part_obj["value"])
+            registry_part = -Decimal(registry_part_obj["value"])
+            if local_part != 0 or registry_part != 0:
+                allocations.append(Allocation(
+                    _name(a["membership"]), local_part, registry_part
+                ))
         entries.append(Entry(
             id=e["id"],
             description=e.get("description") or "",
             date=datetime.fromisoformat(e["date"]),
             paid_by=_name(e["membership_owned"]),
-            amount=-amount,
+            amount=-local_amount,
             currency=cur,
-            amount_registry=-amount_reg,
+            amount_registry=-registry_amount,
             type=e.get("type_transaction", "NORMAL"),
             category=e.get("category_custom") or e.get("category") or "",
-            allocations=[
-                Allocation(_name(a["membership"]), -Decimal(a["amount"]["value"]))
-                for a in e.get("allocations", [])
-                if Decimal(a["amount"]["value"]) != 0
-            ],
+            allocations=allocations,
         ))
     entries.sort(key=lambda x: x.date)
     memberships = [next(iter(m.values())) for m in reg.get("memberships", [])]
@@ -225,6 +245,19 @@ class TricountClient:
         t = _parse(key, raw)
         self._cache[key] = (time.monotonic(), t)
         return t
+
+    def get_exchange_rate(self, from_currency: str, to_currency: str) -> Decimal:
+        """Get a Tricount-provided FX rate; fail closed if absent or invalid."""
+        data = self._request("GET", "/v1/user/{user_id}/exchange-rate",
+                             params={"currency": from_currency})
+        for item in data.get("Response", []):
+            rate = item.get("ExchangeRate", {})
+            if rate.get("currency_target") == to_currency:
+                value = Decimal(str(rate.get("rate", "")))
+                if not value.is_finite() or value <= 0:
+                    raise ValueError("Invalid exchange rate returned by Tricount")
+                return value
+        raise ValueError(f"No Tricount exchange rate for {from_currency} -> {to_currency}")
 
     # --- escritura --------------------------------------------------------
     def _join(self, key: str) -> None:
