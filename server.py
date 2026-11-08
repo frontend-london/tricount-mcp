@@ -8,13 +8,14 @@ import json
 import os
 import sys
 from datetime import date, datetime, time, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
+import re
 
 import httpx
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from tricount_client import Entry, Tricount, TricountClient, fmt, split_amount
+from tricount_client import Entry, Tricount, TricountClient, ZERO_DECIMAL_CURRENCIES, fmt, split_amount
 
 TYPE_LABELS = {"NORMAL": "gasto", "INCOME": "ingreso", "BALANCE": "reembolso"}
 CATEGORIES = {"TRAVEL", "ENTERTAINMENT", "GROCERIES", "HEALTHCARE", "INSURANCE", "RENT_AND_UTILITIES",
@@ -42,8 +43,9 @@ Servidor para consultar y editar tricounts (gastos compartidos). Sigue este fluj
 5. Ambigüedad: si un nombre no calza o coincide con varios miembros, pregunta; no adivines.
 6. Borrar: identifica el movimiento con list_expenses y confirma con el usuario cuál es antes de borrar.
 
-Notas: los montos van en la moneda del tricount (CLP sin decimales). En los balances, positivo
-significa que al miembro le deben y negativo que debe.
+Notas: create_expense admite moneda original por parámetro currency y la convierte
+a moneda del tricount usando tasa de la API, nunca asume que EUR/TRY/USD son PLN.
+En los balances, positivo significa que al miembro le deben y negativo que debe.
 """
 
 try:
@@ -113,6 +115,7 @@ def _entry_dict(e: Entry) -> dict:
         "pagado_por": e.paid_by,
         "monto": str(e.amount),
         "moneda": e.currency,
+        "monto_moneda_grupo": str(e.amount_registry),
         "reparto": {a.member: str(a.amount) for a in e.allocations},
     }
 
@@ -233,7 +236,7 @@ def get_member_detail(member: str, tricount: str | None = None) -> dict:
         ratio = e.amount_registry / e.amount if e.amount else Decimal(1)
         for a in e.allocations:
             if a.member == who:
-                part = a.amount * ratio
+                part = a.amount_registry if a.amount_registry is not None else a.amount * ratio
                 share += part
                 by_category[e.category] = by_category.get(e.category, Decimal(0)) + part
     reimb_sent = sum((e.amount_registry for e in t.entries if e.type == "BALANCE" and e.paid_by == who), Decimal(0))
@@ -298,6 +301,8 @@ def create_expense(
     exact_amounts: dict[str, float] | None = None,
     ratios: dict[str, float] | None = None,
     category: str | None = None,
+    currency: str | None = None,
+    exchange_rate: float | None = None,
     expense_date: date | None = None,
     confirm: bool = False,
 ) -> dict:
@@ -312,8 +317,12 @@ def create_expense(
     Args:
         {acting_as}
         description: qué se compró.
-        amount: monto total (positivo), en la moneda del tricount.
+        amount: monto total (positivo), en la moneda original indicada.
         paid_by: quién pagó ("yo" = acting_as).
+        currency: código ISO 4217 de la moneda original (EUR, USD, TRY, PLN).
+                  Si falta, se usa la moneda del tricount.
+        exchange_rate: opcional, PLN por unidad de moneda original. Sin este
+                       dato, consulta la tasa de cambio de Tricount.
         tricount: link o key del tricount.
         category: FOOD_AND_DRINK, GROCERIES, TRANSPORT, TRAVEL, ENTERTAINMENT, SHOPPING,
             RENT_AND_UTILITIES, HEALTHCARE, INSURANCE, OTHER; o un texto libre (categoría personalizada).
@@ -324,38 +333,69 @@ def create_expense(
         raise ValueError("Usa solo una de split_among, exact_amounts o ratios.")
     t = client.get_tricount(_resolve(tricount), fresh=confirm)
     me = _match(acting_as, t.members)
-    cur = t.currency
+    group_currency = t.currency
+    cur = (currency or group_currency).strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", cur):
+        raise ValueError("currency must be a 3-letter ISO currency code")
     total = Decimal(str(amount))
-    if total <= 0:
-        raise ValueError("El monto debe ser positivo.")
+    if not total.is_finite() or total <= 0:
+        raise ValueError("El monto debe ser positivo y finito.")
+    if total != Decimal(fmt(total, cur)):
+        raise ValueError(f"Too many decimal places for {cur}")
     payer = _match(paid_by, t.members)
+
+    if cur == group_currency:
+        if exchange_rate is not None and Decimal(str(exchange_rate)) != 1:
+            raise ValueError("exchange_rate cannot differ from 1 for group currency")
+        rate = Decimal(1)
+    else:
+        rate = (Decimal(str(exchange_rate)) if exchange_rate is not None
+                else client.get_exchange_rate(cur, group_currency))
+        if not rate.is_finite() or rate <= 0:
+            raise ValueError("exchange_rate must be positive and finite")
+    group_unit = Decimal(1) if group_currency in ZERO_DECIMAL_CURRENCIES else Decimal("0.01")
+    registry_total = (total * rate).quantize(group_unit, rounding=ROUND_HALF_UP)
+    if registry_total <= 0:
+        raise ValueError("Converted amount rounds to zero in group currency")
 
     ratio_by_member: dict[str, Decimal] = {}
     if exact_amounts:
         shares = {_match(n, t.members): Decimal(str(v)) for n, v in exact_amounts.items()}
-        if sum(shares.values()) != total:
-            raise ValueError(f"Los montos exactos suman {sum(shares.values())}, no {total}.")
+        if any(not v.is_finite() or v < 0 for v in shares.values()) or sum(shares.values()) != total:
+            raise ValueError(f"Los montos exactos deben sumar {total}")
     else:
         if ratios:
             ratio_by_member = {_match(n, t.members): Decimal(str(v)) for n, v in ratios.items()}
         else:
             names = [_match(n, t.members) for n in split_among] if split_among else list(t.members)
             ratio_by_member = {n: Decimal(1) for n in dict.fromkeys(names)}
+        if any(not v.is_finite() or v <= 0 for v in ratio_by_member.values()):
+            raise ValueError("All ratios must be positive and finite")
         names = list(ratio_by_member)
         shares = dict(zip(names, split_amount(total, [ratio_by_member[n] for n in names], cur)))
 
+    names = list(shares)
+    weights = [ratio_by_member[n] for n in names] if ratios else [shares[n] for n in names]
+    registry_shares = dict(zip(names, split_amount(registry_total, weights, group_currency)))
+
     payload = {
         "description": description,
-        "amount": {"value": fmt(-total, cur), "currency": cur},
+        "amount": {"value": fmt(-registry_total, group_currency), "currency": group_currency},
         "membership_uuid_owner": t.member_uuids[payer],
-        "allocations": [
-            _allocation(t.member_uuids[n], -v, cur, ratio_by_member.get(n) if ratios else None)
-            for n, v in shares.items()
-        ],
+        "allocations": [],
         "type_transaction": "NORMAL",
         "date": _entry_date(expense_date),
         **_category_fields(category),
     }
+    for n in names:
+        allocation = _allocation(t.member_uuids[n], -registry_shares[n], group_currency,
+                                 ratio_by_member.get(n) if ratios else None)
+        if cur != group_currency:
+            allocation["amount_local"] = {"value": fmt(-shares[n], cur), "currency": cur}
+        payload["allocations"].append(allocation)
+    if cur != group_currency:
+        payload["amount_local"] = {"value": fmt(-total, cur), "currency": cur}
+        payload["exchange_rate"] = str(rate)
     preview = {
         "tricount": t.title,
         "descripcion": description,
@@ -366,6 +406,12 @@ def create_expense(
         "fecha": payload["date"][:10],
         "categoria": category or "UNCATEGORIZED",
     }
+    if cur != group_currency:
+        preview.update({
+            "kwota_w_walucie_grupy": fmt(registry_total, group_currency),
+            "waluta_grupy": group_currency,
+            "kurs": str(rate),
+        })
     return _save_or_preview(t, payload, preview, confirm, me, "create_expense")
 
 
@@ -456,7 +502,7 @@ def delete_entry(acting_as: str, entry_id: int, tricount: str | None = None, con
 def main() -> None:
     port = os.environ.get("PORT")
     if port:  # Cloud Run (o cualquier despliegue HTTP): streamable HTTP sin estado
-        server.run("streamable-http", host="0.0.0.0", port=int(port), stateless_http=True, json_response=True)
+        server.run("streamable-http", host=os.environ.get("TRICOUNT_BIND_HOST", "0.0.0.0"), port=int(port), stateless_http=True, json_response=True)
     else:  # uso local: stdio
         server.run()
 
